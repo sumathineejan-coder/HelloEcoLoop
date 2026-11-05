@@ -3,7 +3,7 @@ const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
-const Database = require('better-sqlite3');
+const sqlite3 = require('sqlite3').verbose();
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const admin = require('firebase-admin');
@@ -71,44 +71,74 @@ const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
 initFirebase();
-const db = new Database(path.join(DATA_DIR, 'ecoloop.sqlite'));
+const dbPath = path.join(DATA_DIR, 'ecoloop.sqlite');
+const db = new sqlite3.Database(dbPath);
 
-db.pragma('journal_mode = WAL');
-db.pragma('foreign_keys = ON');
+// Helper Wrapper เพื่อให้ใช้งาน Async/Await กับ sqlite3 ได้ง่าย
+const dbRun = (sql, params = []) => new Promise((resolve, reject) => {
+  db.run(sql, params, function (err) {
+    if (err) reject(err);
+    else resolve(this);
+  });
+});
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    public_id TEXT NOT NULL,
-    role TEXT NOT NULL CHECK(role IN ('student','merchant')),
-    password_hash TEXT NOT NULL,
-    name TEXT DEFAULT '',
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    UNIQUE(public_id, role)
-  );
-  CREATE TABLE IF NOT EXISTS sessions (
-    token_hash TEXT PRIMARY KEY,
-    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    expires_at INTEGER NOT NULL
-  );
-  CREATE INDEX IF NOT EXISTS sessions_user_idx ON sessions(user_id);
-  CREATE TABLE IF NOT EXISTS verification_codes (
-    code TEXT PRIMARY KEY,
-    student_user_id INTEGER NOT NULL REFERENCES users(id),
-    expires_at INTEGER NOT NULL,
-    used_at INTEGER,
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
-  );
-  CREATE INDEX IF NOT EXISTS codes_student_idx ON verification_codes(student_user_id);
-  CREATE TABLE IF NOT EXISTS transactions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    student_user_id INTEGER NOT NULL REFERENCES users(id),
-    merchant_user_id INTEGER NOT NULL REFERENCES users(id),
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
-  );
-  CREATE INDEX IF NOT EXISTS tx_student_idx ON transactions(student_user_id, id DESC);
-  CREATE INDEX IF NOT EXISTS tx_merchant_idx ON transactions(merchant_user_id, id DESC);
-`);
+const dbGet = (sql, params = []) => new Promise((resolve, reject) => {
+  db.get(sql, params, (err, row) => {
+    if (err) reject(err);
+    else resolve(row);
+  });
+});
+
+const dbAll = (sql, params = []) => new Promise((resolve, reject) => {
+  db.all(sql, params, (err, rows) => {
+    if (err) reject(err);
+    else resolve(rows);
+  });
+});
+
+// สร้างตาราง
+db.serialize(() => {
+  db.run('PRAGMA foreign_keys = ON;');
+  db.run(`
+    CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      public_id TEXT NOT NULL,
+      role TEXT NOT NULL CHECK(role IN ('student','merchant')),
+      password_hash TEXT NOT NULL,
+      name TEXT DEFAULT '',
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(public_id, role)
+    );
+  `);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS sessions (
+      token_hash TEXT PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      expires_at INTEGER NOT NULL
+    );
+  `);
+  db.run(`CREATE INDEX IF NOT EXISTS sessions_user_idx ON sessions(user_id);`);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS verification_codes (
+      code TEXT PRIMARY KEY,
+      student_user_id INTEGER NOT NULL REFERENCES users(id),
+      expires_at INTEGER NOT NULL,
+      used_at INTEGER,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+  `);
+  db.run(`CREATE INDEX IF NOT EXISTS codes_student_idx ON verification_codes(student_user_id);`);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS transactions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      student_user_id INTEGER NOT NULL REFERENCES users(id),
+      merchant_user_id INTEGER NOT NULL REFERENCES users(id),
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+  `);
+  db.run(`CREATE INDEX IF NOT EXISTS tx_student_idx ON transactions(student_user_id, id DESC);`);
+  db.run(`CREATE INDEX IF NOT EXISTS tx_merchant_idx ON transactions(merchant_user_id, id DESC);`);
+});
 
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(express.json({ limit: '20kb' }));
@@ -117,25 +147,29 @@ app.use('/api/', rateLimit({ windowMs: 60_000, limit: 120, standardHeaders: 'dra
 const cookieName = 'ecoloop_session';
 const hashToken = token => crypto.createHash('sha256').update(token).digest('hex');
 
-function setSession(res, userId) {
+async function setSession(res, userId) {
   const token = crypto.randomBytes(32).toString('hex');
   const expires = Date.now() + 7 * 24 * 60 * 60 * 1000;
-  db.prepare('INSERT INTO sessions(token_hash,user_id,expires_at) VALUES(?,?,?)').run(hashToken(token), userId, expires);
+  await dbRun('INSERT INTO sessions(token_hash,user_id,expires_at) VALUES(?,?,?)', [hashToken(token), userId, expires]);
   res.cookie(cookieName, token, { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'strict', path: '/', maxAge: 7 * 24 * 60 * 60 * 1000 });
 }
 
-function auth(req, res, next) {
+async function auth(req, res, next) {
   const token = req.cookies?.[cookieName];
   if (!token) return res.status(401).json({ error: 'กรุณาเข้าสู่ระบบก่อน' });
   
-  const row = db.prepare(`SELECT u.id,u.public_id,u.role,u.name,s.expires_at FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=?`).get(hashToken(token));
-  if (!row || row.expires_at < Date.now()) {
-    if (token) db.prepare('DELETE FROM sessions WHERE token_hash=?').run(hashToken(token));
-    res.clearCookie(cookieName, { path: '/' });
-    return res.status(401).json({ error: 'เซสชันหมดอายุ กรุณาเข้าสู่ระบบใหม่' });
+  try {
+    const row = await dbGet(`SELECT u.id,u.public_id,u.role,u.name,s.expires_at FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=?`, [hashToken(token)]);
+    if (!row || row.expires_at < Date.now()) {
+      if (token) await dbRun('DELETE FROM sessions WHERE token_hash=?', [hashToken(token)]);
+      res.clearCookie(cookieName, { path: '/' });
+      return res.status(401).json({ error: 'เซสชันหมดอายุ กรุณาเข้าสู่ระบบใหม่' });
+    }
+    req.user = { dbId: row.id, id: row.public_id, role: row.role, name: row.name || '' };
+    next();
+  } catch (err) {
+    res.status(500).json({ error: 'เกิดข้อผิดพลาดในการตรวจสอบสิทธิ์' });
   }
-  req.user = { dbId: row.id, id: row.public_id, role: row.role, name: row.name || '' };
-  next();
 }
 
 const requireRole = role => (req, res, next) => req.user.role === role ? next() : res.status(403).json({ error: 'ไม่มีสิทธิ์ใช้งานส่วนนี้' });
@@ -165,14 +199,14 @@ app.post('/api/register', async (req, res) => {
   let lastID;
   try {
     const hash = await bcrypt.hash(password, 12);
-    const info = db.prepare('INSERT INTO users(public_id,role,password_hash,name) VALUES(?,?,?,?)').run(String(id), role, hash, String(name).trim());
-    lastID = info.lastInsertRowid;
+    const result = await dbRun('INSERT INTO users(public_id,role,password_hash,name) VALUES(?,?,?,?)', [String(id), role, hash, String(name).trim()]);
+    lastID = result.lastID;
 
     const savedName = await saveFirebaseProfile(role, String(id), name);
-    setSession(res, lastID);
+    await setSession(res, lastID);
     res.json({ user: { id: String(id), role, name: savedName, profileType: role === 'student' ? 'นักศึกษา' : 'ร้านค้า' } });
   } catch (e) { 
-    if (lastID) db.prepare('DELETE FROM users WHERE id=?').run(lastID);
+    if (lastID) await dbRun('DELETE FROM users WHERE id=?', [lastID]).catch(() => {});
     if (String(e.message).includes('UNIQUE')) return res.status(409).json({ error: 'รหัสนี้สมัครบัญชีประเภทนี้ไว้แล้ว กรุณาเข้าสู่ระบบ' }); 
     res.status(500).json({ error: 'ไม่สามารถสร้างบัญชีได้' }); 
   }
@@ -184,60 +218,64 @@ app.post('/api/login', async (req, res) => {
     return res.status(400).json({ error: 'ข้อมูลเข้าสู่ระบบไม่ถูกต้อง' });
   }
   
-  const row = db.prepare('SELECT * FROM users WHERE public_id=? AND role=?').get(String(id), role);
-  if (!row || !(await bcrypt.compare(password, row.password_hash))) {
-    return res.status(401).json({ error: 'ไม่พบบัญชีหรือรหัสผ่านไม่ถูกต้อง หากยังไม่มีบัญชีให้กดสมัครบัญชีใหม่' });
+  try {
+    const row = await dbGet('SELECT * FROM users WHERE public_id=? AND role=?', [String(id), role]);
+    if (!row || !(await bcrypt.compare(password, row.password_hash))) {
+      return res.status(401).json({ error: 'ไม่พบบัญชีหรือรหัสผ่านไม่ถูกต้อง หากยังไม่มีบัญชีให้กดสมัครบัญชีใหม่' });
+    }
+    
+    const profile = await getFirebaseProfile(row.role, row.public_id);
+    const displayName = profile?.name || row.name || row.public_id;
+    
+    await setSession(res, row.id);
+    res.json({ user: { id: row.public_id, role: row.role, name: displayName, profileType: row.role === 'student' ? 'นักศึกษา' : 'ร้านค้า' } });
+  } catch (err) {
+    res.status(500).json({ error: 'เกิดข้อผิดพลาดในการเข้าสู่ระบบ' });
   }
-  
-  const profile = await getFirebaseProfile(row.role, row.public_id);
-  const displayName = profile?.name || row.name || row.public_id;
-  
-  setSession(res, row.id);
-  res.json({ user: { id: row.public_id, role: row.role, name: displayName, profileType: row.role === 'student' ? 'นักศึกษา' : 'ร้านค้า' } });
 });
 
 app.get('/api/me', auth, async (req, res) => res.json({ user: await publicUser(req.user) }));
 
-app.post('/api/logout', (req, res) => {
+app.post('/api/logout', async (req, res) => {
   const token = req.cookies?.[cookieName];
-  if (token) db.prepare('DELETE FROM sessions WHERE token_hash=?').run(hashToken(token));
+  if (token) await dbRun('DELETE FROM sessions WHERE token_hash=?', [hashToken(token)]);
   res.clearCookie(cookieName, { path: '/' });
   res.json({ ok: true });
 });
 
-app.post('/api/codes', auth, requireRole('student'), (req, res) => {
-  db.prepare('UPDATE verification_codes SET used_at=? WHERE student_user_id=? AND used_at IS NULL').run(Date.now(), req.user.dbId);
+app.post('/api/codes', auth, requireRole('student'), async (req, res) => {
+  await dbRun('UPDATE verification_codes SET used_at=? WHERE student_user_id=? AND used_at IS NULL', [Date.now(), req.user.dbId]);
   let code; 
   do { 
     code = String(crypto.randomInt(100000, 1000000)); 
-  } while (db.prepare('SELECT 1 FROM verification_codes WHERE code=?').get(code));
+  } while (await dbGet('SELECT 1 FROM verification_codes WHERE code=?', [code]));
   
   const expires = Date.now() + 60_000;
-  db.prepare('INSERT INTO verification_codes(code,student_user_id,expires_at) VALUES(?,?,?)').run(code, req.user.dbId, expires);
+  await dbRun('INSERT INTO verification_codes(code,student_user_id,expires_at) VALUES(?,?,?)', [code, req.user.dbId, expires]);
   res.json({ code, expires_at: new Date(expires).toISOString() });
 });
 
-app.post('/api/codes/lookup', auth, requireRole('merchant'), (req, res) => {
+app.post('/api/codes/lookup', auth, requireRole('merchant'), async (req, res) => {
   const code = String(req.body?.code || '');
   if (!/^\d{6}$/.test(code)) return res.status(400).json({ error: 'กรุณากรอกรหัส 6 หลัก' });
-  const row = db.prepare(`SELECT v.*,u.public_id AS student_id FROM verification_codes v JOIN users u ON u.id=v.student_user_id WHERE v.code=?`).get(code);
+  const row = await dbGet(`SELECT v.*,u.public_id AS student_id FROM verification_codes v JOIN users u ON u.id=v.student_user_id WHERE v.code=?`, [code]);
   if (!row || row.used_at || row.expires_at <= Date.now()) return res.status(404).json({ error: 'ไม่พบรหัส รหัสหมดอายุ หรือถูกใช้ไปแล้ว' });
   res.json({ student_id: row.student_id });
 });
 
-app.post('/api/codes/confirm', auth, requireRole('merchant'), (req, res) => {
+app.post('/api/codes/confirm', auth, requireRole('merchant'), async (req, res) => {
   const code = String(req.body?.code || '');
   if (req.body?.observed !== true) return res.status(400).json({ error: 'กรุณายืนยันว่าเห็นการใช้แก้วส่วนตัวจริง' });
   if (!/^\d{6}$/.test(code)) return res.status(400).json({ error: 'รหัสไม่ถูกต้อง' });
   
   try { 
-    const row = db.prepare('SELECT * FROM verification_codes WHERE code=?').get(code);
+    const row = await dbGet('SELECT * FROM verification_codes WHERE code=?', [code]);
     if (!row || row.used_at || row.expires_at <= Date.now()) return res.status(409).json({ error: 'รหัสหมดอายุหรือถูกใช้ไปแล้ว' });
     
-    const updateResult = db.prepare('UPDATE verification_codes SET used_at=? WHERE code=? AND used_at IS NULL AND expires_at>?').run(Date.now(), code, Date.now());
+    const updateResult = await dbRun('UPDATE verification_codes SET used_at=? WHERE code=? AND used_at IS NULL AND expires_at>?', [Date.now(), code, Date.now()]);
     if (updateResult.changes === 0) return res.status(409).json({ error: 'รหัสหมดอายุหรือถูกใช้ไปแล้ว' });
     
-    db.prepare('INSERT INTO transactions(student_user_id,merchant_user_id) VALUES(?,?)').run(row.student_user_id, req.user.dbId);
+    await dbRun('INSERT INTO transactions(student_user_id,merchant_user_id) VALUES(?,?)', [row.student_user_id, req.user.dbId]);
     res.json({ ok: true, points_awarded: 100 }); 
   } catch (e) {
     res.status(500).json({ error: 'บันทึกรายการไม่สำเร็จ' });
@@ -249,10 +287,10 @@ app.get('/api/dashboard', auth, async (req, res) => {
   const displayName = profile?.name || req.user.name || req.user.id;
   
   if (req.user.role === 'student') {
-    const tx = db.prepare(`SELECT t.id,t.created_at,m.public_id AS merchant_id FROM transactions t JOIN users m ON m.id=t.merchant_user_id WHERE t.student_user_id=? ORDER BY t.id DESC LIMIT 100`).all(req.user.dbId);
-    const active = db.prepare('SELECT code,expires_at FROM verification_codes WHERE student_user_id=? AND used_at IS NULL AND expires_at>? ORDER BY expires_at DESC LIMIT 1').get(req.user.dbId, Date.now());
-    const cupsRow = db.prepare('SELECT COUNT(*) AS n FROM transactions WHERE student_user_id=?').get(req.user.dbId);
-    const pointsRow = db.prepare('SELECT COUNT(*)*100 AS n FROM transactions WHERE student_user_id=?').get(req.user.dbId);
+    const tx = await dbAll(`SELECT t.id,t.created_at,m.public_id AS merchant_id FROM transactions t JOIN users m ON m.id=t.merchant_user_id WHERE t.student_user_id=? ORDER BY t.id DESC LIMIT 100`, [req.user.dbId]);
+    const active = await dbGet('SELECT code,expires_at FROM verification_codes WHERE student_user_id=? AND used_at IS NULL AND expires_at>? ORDER BY expires_at DESC LIMIT 1', [req.user.dbId, Date.now()]);
+    const cupsRow = await dbGet('SELECT COUNT(*) AS n FROM transactions WHERE student_user_id=?', [req.user.dbId]);
+    const pointsRow = await dbGet('SELECT COUNT(*)*100 AS n FROM transactions WHERE student_user_id=?', [req.user.dbId]);
     
     res.json({
       user: { id: req.user.id, role: req.user.role, name: displayName, profileType: 'นักศึกษา' },
@@ -261,8 +299,8 @@ app.get('/api/dashboard', auth, async (req, res) => {
       activeCode: active ? { code: active.code, expires_at: new Date(active.expires_at).toISOString() } : null
     });
   } else {
-    const tx = db.prepare(`SELECT t.id,t.created_at,s.public_id AS student_id FROM transactions t JOIN users s ON s.id=t.student_user_id WHERE t.merchant_user_id=? ORDER BY t.id DESC LIMIT 100`).all(req.user.dbId);
-    const todayRow = db.prepare(`SELECT COUNT(*) AS n FROM transactions WHERE merchant_user_id=? AND date(created_at,'localtime')=date('now','localtime')`).get(req.user.dbId);
+    const tx = await dbAll(`SELECT t.id,t.created_at,s.public_id AS student_id FROM transactions t JOIN users s ON s.id=t.student_user_id WHERE t.merchant_user_id=? ORDER BY t.id DESC LIMIT 100`, [req.user.dbId]);
+    const todayRow = await dbGet(`SELECT COUNT(*) AS n FROM transactions WHERE merchant_user_id=? AND date(created_at,'localtime')=date('now','localtime')`, [req.user.dbId]);
     
     res.json({ user: { id: req.user.id, role: req.user.role, name: displayName, profileType: 'ร้านค้า' }, transactions: tx, stats: { today: todayRow ? todayRow.n : 0 } });
   }
