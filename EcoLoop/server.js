@@ -34,26 +34,30 @@ function initFirebase() {
 
 async function getFirebaseProfile(role, publicId) {
   if (!firestore) return null;
-  const candidates = [
-    firestore.collection('users').doc(`${role}_${publicId}`),
-    firestore.collection('users').doc(String(publicId))
-  ];
-  for (const ref of candidates) {
-    const snap = await ref.get();
-    if (snap.exists) {
-      const data = snap.data() || {};
-      if (data.role && data.role !== role) continue;
-      const name = role === 'merchant'
-        ? (data.shopName || data.storeName || data.displayName || data.name || data.fullName)
-        : (data.fullName || data.displayName || data.name || data.studentName);
-      return { name: typeof name === 'string' ? name.trim() : '', role };
+  try {
+    const candidates = [
+      firestore.collection('users').doc(`${role}_${publicId}`),
+      firestore.collection('users').doc(String(publicId))
+    ];
+    for (const ref of candidates) {
+      const snap = await ref.get();
+      if (snap.exists) {
+        const data = snap.data() || {};
+        if (data.role && data.role !== role) continue;
+        const name = role === 'merchant'
+          ? (data.shopName || data.storeName || data.displayName || data.name || data.fullName)
+          : (data.fullName || data.displayName || data.name || data.studentName);
+        return { name: typeof name === 'string' ? name.trim() : '', role };
+      }
     }
+  } catch (e) {
+    console.error('getFirebaseProfile error:', e.message);
   }
   return null;
 }
 
 async function saveFirebaseProfile(role, publicId, name) {
-  if (!firestore) throw new Error('ยังไม่ได้เชื่อมต่อ Firebase กรุณาตั้งค่า FIREBASE_SERVICE_ACCOUNT_PATH ก่อน');
+  if (!firestore) return String(name).trim();
   const field = role === 'merchant' ? 'shopName' : 'fullName';
   await firestore.collection('users').doc(`${role}_${publicId}`).set({
     publicId: String(publicId), role, [field]: String(name).trim(), updatedAt: admin.firestore.FieldValue.serverTimestamp()
@@ -78,6 +82,7 @@ db.exec(`
     public_id TEXT NOT NULL,
     role TEXT NOT NULL CHECK(role IN ('student','merchant')),
     password_hash TEXT NOT NULL,
+    name TEXT DEFAULT '',
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE(public_id, role)
   );
@@ -123,13 +128,13 @@ function auth(req, res, next) {
   const token = req.cookies?.[cookieName];
   if (!token) return res.status(401).json({ error: 'กรุณาเข้าสู่ระบบก่อน' });
   
-  const row = db.prepare(`SELECT u.id,u.public_id,u.role,s.expires_at FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=?`).get(hashToken(token));
+  const row = db.prepare(`SELECT u.id,u.public_id,u.role,u.name,s.expires_at FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=?`).get(hashToken(token));
   if (!row || row.expires_at < Date.now()) {
     if (token) db.prepare('DELETE FROM sessions WHERE token_hash=?').run(hashToken(token));
     res.clearCookie(cookieName, { path: '/' });
     return res.status(401).json({ error: 'เซสชันหมดอายุ กรุณาเข้าสู่ระบบใหม่' });
   }
-  req.user = { dbId: row.id, id: row.public_id, role: row.role };
+  req.user = { dbId: row.id, id: row.public_id, role: row.role, name: row.name || '' };
   next();
 }
 
@@ -137,7 +142,8 @@ const requireRole = role => (req, res, next) => req.user.role === role ? next() 
 
 async function publicUser(u) {
   const profile = await getFirebaseProfile(u.role, u.id);
-  return { id: u.id, role: u.role, name: profile?.name || '', profileType: u.role === 'student' ? 'นักศึกษา' : 'ร้านค้า' };
+  const name = profile?.name || u.name || u.id;
+  return { id: u.id, role: u.role, name, profileType: u.role === 'student' ? 'นักศึกษา' : 'ร้านค้า' };
 }
 
 app.use((req, res, next) => {
@@ -159,7 +165,7 @@ app.post('/api/register', async (req, res) => {
   let lastID;
   try {
     const hash = await bcrypt.hash(password, 12);
-    const info = db.prepare('INSERT INTO users(public_id,role,password_hash) VALUES(?,?,?)').run(String(id), role, hash);
+    const info = db.prepare('INSERT INTO users(public_id,role,password_hash,name) VALUES(?,?,?,?)').run(String(id), role, hash, String(name).trim());
     lastID = info.lastInsertRowid;
 
     const savedName = await saveFirebaseProfile(role, String(id), name);
@@ -184,10 +190,10 @@ app.post('/api/login', async (req, res) => {
   }
   
   const profile = await getFirebaseProfile(row.role, row.public_id);
-  if (!profile?.name) return res.status(409).json({ error: 'ไม่พบชื่อบัญชีใน Firebase กรุณาติดต่อผู้ดูแลระบบให้เพิ่มชื่อบัญชีใน Firestore ก่อน' });
+  const displayName = profile?.name || row.name || row.public_id;
   
   setSession(res, row.id);
-  res.json({ user: { id: row.public_id, role: row.role, name: profile.name, profileType: row.role === 'student' ? 'นักศึกษา' : 'ร้านค้า' } });
+  res.json({ user: { id: row.public_id, role: row.role, name: displayName, profileType: row.role === 'student' ? 'นักศึกษา' : 'ร้านค้า' } });
 });
 
 app.get('/api/me', auth, async (req, res) => res.json({ user: await publicUser(req.user) }));
@@ -240,7 +246,7 @@ app.post('/api/codes/confirm', auth, requireRole('merchant'), (req, res) => {
 
 app.get('/api/dashboard', auth, async (req, res) => {
   const profile = await getFirebaseProfile(req.user.role, req.user.id);
-  if (!profile?.name) return res.status(409).json({ error: 'ไม่พบชื่อบัญชีใน Firebase กรุณาตรวจสอบข้อมูลโปรไฟล์' });
+  const displayName = profile?.name || req.user.name || req.user.id;
   
   if (req.user.role === 'student') {
     const tx = db.prepare(`SELECT t.id,t.created_at,m.public_id AS merchant_id FROM transactions t JOIN users m ON m.id=t.merchant_user_id WHERE t.student_user_id=? ORDER BY t.id DESC LIMIT 100`).all(req.user.dbId);
@@ -249,7 +255,7 @@ app.get('/api/dashboard', auth, async (req, res) => {
     const pointsRow = db.prepare('SELECT COUNT(*)*100 AS n FROM transactions WHERE student_user_id=?').get(req.user.dbId);
     
     res.json({
-      user: { id: req.user.id, role: req.user.role, name: profile.name, profileType: 'นักศึกษา' },
+      user: { id: req.user.id, role: req.user.role, name: displayName, profileType: 'นักศึกษา' },
       transactions: tx,
       stats: { cups: cupsRow ? cupsRow.n : 0, points: pointsRow ? pointsRow.n : 0 },
       activeCode: active ? { code: active.code, expires_at: new Date(active.expires_at).toISOString() } : null
@@ -258,7 +264,7 @@ app.get('/api/dashboard', auth, async (req, res) => {
     const tx = db.prepare(`SELECT t.id,t.created_at,s.public_id AS student_id FROM transactions t JOIN users s ON s.id=t.student_user_id WHERE t.merchant_user_id=? ORDER BY t.id DESC LIMIT 100`).all(req.user.dbId);
     const todayRow = db.prepare(`SELECT COUNT(*) AS n FROM transactions WHERE merchant_user_id=? AND date(created_at,'localtime')=date('now','localtime')`).get(req.user.dbId);
     
-    res.json({ user: { id: req.user.id, role: req.user.role, name: profile.name, profileType: 'ร้านค้า' }, transactions: tx, stats: { today: todayRow ? todayRow.n : 0 } });
+    res.json({ user: { id: req.user.id, role: req.user.role, name: displayName, profileType: 'ร้านค้า' }, transactions: tx, stats: { today: todayRow ? todayRow.n : 0 } });
   }
 });
 
